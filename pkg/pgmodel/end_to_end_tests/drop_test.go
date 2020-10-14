@@ -5,6 +5,7 @@ package end_to_end_tests
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -332,53 +333,131 @@ func TestSQLDropMetricChunk(t *testing.T) {
 		if err != nil {
 			t.Error(err)
 		}
+		err = ingestor.CompleteMetricCreation()
+		if err != nil {
+			t.Error(err)
+		}
 
-		wasDropped := false
-		err = db.QueryRow(context.Background(), "SELECT _prom_catalog.drop_metric_chunks($1, $2)", "test", chunkEnds.Add(time.Second*5)).Scan(&wasDropped)
+		_, err = db.Exec(context.Background(), "CALL _prom_catalog.drop_metric_chunks($1, $2)", "test", chunkEnds.Add(time.Second*5))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !wasDropped {
-			t.Errorf("Expected chunk to be dropped")
+
+		before_delete_correct := func(loc string) {
+			count := 0
+			err = db.QueryRow(context.Background(), `SELECT count(*) FROM prom_data.test`).Scan(&count)
+			if err != nil {
+				t.Error(loc, err)
+			}
+			if count != 2 {
+				t.Errorf("unexpected row count: %v @ %v", count, loc)
+			}
+
+			err = db.QueryRow(context.Background(), `SELECT count(*) FROM _prom_catalog.series`).Scan(&count)
+			if err != nil {
+				t.Error(loc, err)
+			}
+
+			// none of the series should be removed yet
+			if count != 3 {
+				t.Errorf("unexpected series count: %v @ %v", count, loc)
+			}
+
+			err = db.QueryRow(context.Background(), `SELECT count(*) FROM _prom_catalog.series WHERE delete_epoch IS NOT NULL`).Scan(&count)
+			if err != nil {
+				t.Error(loc, err)
+			}
+
+			// one of the series should be marked for deletion
+			if count != 1 {
+				t.Errorf("unexpected series count: %v @ %v", count, loc)
+			}
+
+			err = db.QueryRow(context.Background(), `SELECT count(*) FROM _prom_catalog.label where key='name1'`).Scan(&count)
+			if err != nil {
+				t.Error(loc, err)
+			}
+
+			// none of the labels should deleted yet
+			if count != 3 {
+				t.Errorf("unexpected labels count: %v @ %v", count, loc)
+			}
 		}
 
-		count := 0
-		err = db.QueryRow(context.Background(), `SELECT count(*) FROM prom_data.test`).Scan(&count)
-		if err != nil {
-			t.Error(err)
-		}
+		before_delete_correct("after first")
 
-		if count != 2 {
-			t.Errorf("unexpected row count: %v", count)
-		}
-
-		err = db.QueryRow(context.Background(), `SELECT count(*) FROM _prom_catalog.series`).Scan(&count)
-		if err != nil {
-			t.Error(err)
-		}
-
-		if count != 2 {
-			t.Errorf("unexpected series count: %v", count)
-		}
-
-		err = db.QueryRow(context.Background(), `SELECT count(*) FROM _prom_catalog.label where key='name1'`).Scan(&count)
-		if err != nil {
-			t.Error(err)
-		}
-
-		if count != 2 {
-			t.Errorf("unexpected labels count: %v", count)
-		}
-
-		//rerun again -- nothing dropped
-		err = db.QueryRow(context.Background(), "SELECT _prom_catalog.drop_metric_chunks($1, $2)", "test", chunkEnds.Add(time.Second*5)).Scan(&wasDropped)
+		//rerun again -- nothing changes
+		_, err = db.Exec(context.Background(), "CALL _prom_catalog.drop_metric_chunks($1, $2)", "test", chunkEnds.Add(time.Second*5))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if wasDropped {
-			t.Errorf("Expected chunk to not be dropped")
+		before_delete_correct("after first repeat")
+
+		// reruns don't change anything until the dead series are actually dropped
+		for i := 0; i < 6; i++ {
+			drop := fmt.Sprintf("CALL _prom_catalog.drop_metric_chunks($1, $2, now()+'%v hours')", i)
+			_, err = db.Exec(context.Background(), drop, "test", chunkEnds.Add(time.Second*5))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			before_delete_correct(fmt.Sprintf("after loop %v", i))
 		}
 
+		before_delete_correct("after all loops")
+
+		after_delete_correct := func(loc string) {
+			count := 0
+			err = db.QueryRow(context.Background(), `SELECT count(*) FROM prom_data.test`).Scan(&count)
+			if err != nil {
+				t.Error(loc, err)
+			}
+			if count != 2 {
+				t.Errorf("unexpected row count: %v @ %v", count, loc)
+			}
+
+			err = db.QueryRow(context.Background(), `SELECT count(*) FROM _prom_catalog.series`).Scan(&count)
+			if err != nil {
+				t.Error(loc, err)
+			}
+
+			// one of the series should be removed
+			if count != 2 {
+				t.Errorf("unexpected series count: %v @ %v", count, loc)
+			}
+
+			err = db.QueryRow(context.Background(), `SELECT count(*) FROM _prom_catalog.series WHERE delete_epoch IS NOT NULL`).Scan(&count)
+			if err != nil {
+				t.Error(loc, err)
+			}
+
+			// no series should be marked for deletion
+			if count != 0 {
+				t.Errorf("unexpected series count: %v @ %v", count, loc)
+			}
+
+			err = db.QueryRow(context.Background(), `SELECT count(*) FROM _prom_catalog.label where key='name1'`).Scan(&count)
+			if err != nil {
+				t.Error(loc, err)
+			}
+
+			// unused labels should be deleted
+			if count != 2 {
+				t.Errorf("unexpected labels count: %v @ %v", count, loc)
+			}
+		}
+
+		for i := 6; i < 10; i++ {
+			drop := fmt.Sprintf("CALL _prom_catalog.drop_metric_chunks($1, $2, now()+'%v hours')", i)
+			_, err = db.Exec(context.Background(), drop, "test", chunkEnds.Add(time.Second*5))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			after_delete_correct(fmt.Sprintf("after loop %v", i))
+		}
+
+		after_delete_correct("after all loops")
 	})
 }
 
@@ -427,14 +506,14 @@ func TestSQLDropAllMetricData(t *testing.T) {
 		if err != nil {
 			t.Error(err)
 		}
+		err = ingestor.CompleteMetricCreation()
+		if err != nil {
+			t.Error(err)
+		}
 
-		wasDropped := false
-		err = db.QueryRow(context.Background(), "SELECT _prom_catalog.drop_metric_chunks($1, $2)", "test", chunkEnds.Add(time.Second*5)).Scan(&wasDropped)
+		_, err = db.Exec(context.Background(), "CALL _prom_catalog.drop_metric_chunks($1, $2)", "test", chunkEnds.Add(time.Second*5))
 		if err != nil {
 			t.Fatal(err)
-		}
-		if !wasDropped {
-			t.Errorf("Expected chunk to be dropped")
 		}
 
 		count := 0
@@ -452,7 +531,16 @@ func TestSQLDropAllMetricData(t *testing.T) {
 			t.Error(err)
 		}
 
-		if count != 0 {
+		if count != 1 {
+			t.Errorf("unexpected series count: %v", count)
+		}
+
+		err = db.QueryRow(context.Background(), `SELECT count(*) FROM _prom_catalog.series WHERE delete_epoch IS NOT NULL`).Scan(&count)
+		if err != nil {
+			t.Error(err)
+		}
+
+		if count != 1 {
 			t.Errorf("unexpected series count: %v", count)
 		}
 
@@ -461,7 +549,7 @@ func TestSQLDropAllMetricData(t *testing.T) {
 			t.Error(err)
 		}
 
-		if count != 1 {
+		if count != 2 {
 			t.Errorf("unexpected label count: %v", count)
 		}
 
@@ -507,6 +595,15 @@ func TestSQLDropAllMetricData(t *testing.T) {
 		}
 
 		if count != 1 {
+			t.Errorf("unexpected series count: %v", count)
+		}
+
+		err = db.QueryRow(context.Background(), `SELECT count(*) FROM _prom_catalog.series WHERE delete_epoch IS NOT NULL`).Scan(&count)
+		if err != nil {
+			t.Error(err)
+		}
+
+		if count != 0 {
 			t.Errorf("unexpected series count: %v", count)
 		}
 	})
