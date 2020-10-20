@@ -632,6 +632,7 @@ func tryRecovery(conn pgxConn, err error, req copyRequest) error {
 func doInsert(conn pgxConn, reqs ...copyRequest) (err error) {
 	batch := conn.NewBatch()
 	numRowsPerInsert := make([]int, 0, len(reqs))
+	numRowsTotal := 0
 	for r := range reqs {
 		req := &reqs[r]
 		numRows := 0
@@ -662,11 +663,13 @@ func doInsert(conn pgxConn, reqs ...copyRequest) (err error) {
 		if len(times) != numRows {
 			panic("invalid insert request")
 		}
+		numRowsTotal += numRows
 		numRowsPerInsert = append(numRowsPerInsert, numRows)
 		queryString := fmt.Sprintf("INSERT INTO %s(time, value, series_id) SELECT * FROM unnest($1::TIMESTAMPTZ[], $2::DOUBLE PRECISION[], $3::BIGINT[]) a(t,v,s) ORDER BY s,t ON CONFLICT DO NOTHING", pgx.Identifier{dataSchema, req.table}.Sanitize())
 		batch.Queue(queryString, times, vals, series)
 	}
 
+	numRowsPerBatch.Observe(float64(numRowsTotal))
 	results, err := conn.SendBatch(context.Background(), batch)
 	if err != nil {
 		return err
