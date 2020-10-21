@@ -574,7 +574,11 @@ func TestPGXInserterInsertSeries(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			mock := newSqlRecorder(c.sqlQueries, t)
 
-			inserter := insertHandler{conn: mock, seriesCache: make(map[string]SeriesID)}
+			inserter := insertHandler{
+				conn:             mock,
+				seriesCache:      make(map[string]SeriesID),
+				seriesCacheEpoch: -1,
+			}
 
 			lsi := make([]samplesInfo, 0)
 			for _, ser := range c.series {
@@ -609,6 +613,186 @@ func TestPGXInserterInsertSeries(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPGXInserterCacheReset(t *testing.T) {
+
+	series := []labels.Labels{
+		{
+			{Name: "__name__", Value: "metric_1"},
+			{Name: "name_1", Value: "value_1"},
+		},
+		{
+			{Name: "name_1", Value: "value_2"},
+			{Name: "__name__", Value: "metric_1"},
+		},
+	}
+
+	sqlQueries := []sqlQuery{
+
+		// first series cache fetch
+		{sql: "BEGIN;"},
+		{
+			sql:     "SELECT current_epoch FROM _prom_catalog.ids_epoch LIMIT 1",
+			args:    []interface{}(nil),
+			results: rowResults{{int64(1)}},
+			err:     error(nil),
+		},
+		{sql: "COMMIT;"},
+		{sql: "BEGIN;"},
+		{
+			sql: "SELECT * FROM _prom_catalog.get_or_create_series_id_for_kv_array($1, $2, $3)",
+			args: []interface{}{
+				"metric_1",
+				[]string{"__name__", "name_1"},
+				[]string{"metric_1", "value_1"},
+			},
+			results: rowResults{{"table", int64(1)}},
+			err:     error(nil),
+		},
+		{sql: "COMMIT;"},
+		{sql: "BEGIN;"},
+		{
+			sql: "SELECT * FROM _prom_catalog.get_or_create_series_id_for_kv_array($1, $2, $3)",
+			args: []interface{}{
+				"metric_1",
+				[]string{"__name__", "name_1"},
+				[]string{"metric_1", "value_2"},
+			},
+			results: rowResults{{"table", int64(2)}},
+			err:     error(nil),
+		},
+		{sql: "COMMIT;"},
+
+		// first labels cache refresh, does not trash
+		{
+			sql:     "SELECT current_epoch FROM _prom_catalog.ids_epoch LIMIT 1",
+			args:    []interface{}(nil),
+			results: rowResults{{int64(1)}},
+			err:     error(nil),
+		},
+
+		// second labels cache refresh, trash the cache
+		{
+			sql:     "SELECT current_epoch FROM _prom_catalog.ids_epoch LIMIT 1",
+			args:    []interface{}(nil),
+			results: rowResults{{int64(2)}},
+			err:     error(nil),
+		},
+
+		// repopulate the cache
+		{sql: "BEGIN;"},
+		{
+			sql:     "SELECT current_epoch FROM _prom_catalog.ids_epoch LIMIT 1",
+			args:    []interface{}(nil),
+			results: rowResults{{int64(2)}},
+			err:     error(nil),
+		},
+		{sql: "COMMIT;"},
+		{sql: "BEGIN;"},
+		{
+			sql: "SELECT * FROM _prom_catalog.get_or_create_series_id_for_kv_array($1, $2, $3)",
+			args: []interface{}{
+				"metric_1",
+				[]string{"__name__", "name_1"},
+				[]string{"metric_1", "value_1"},
+			},
+			results: rowResults{{"table", int64(3)}},
+			err:     error(nil),
+		},
+		{sql: "COMMIT;"},
+		{sql: "BEGIN;"},
+		{
+			sql: "SELECT * FROM _prom_catalog.get_or_create_series_id_for_kv_array($1, $2, $3)",
+			args: []interface{}{
+				"metric_1",
+				[]string{"__name__", "name_1"},
+				[]string{"metric_1", "value_2"},
+			},
+			results: rowResults{{"table", int64(4)}},
+			err:     error(nil),
+		},
+		{sql: "COMMIT;"},
+	}
+
+	mock := newSqlRecorder(sqlQueries, t)
+
+	inserter := insertHandler{
+		conn:             mock,
+		seriesCache:      make(map[string]SeriesID),
+		seriesCacheEpoch: -1,
+	}
+
+	makeSamples := func(series []labels.Labels) []samplesInfo {
+		lsi := make([]samplesInfo, 0)
+		for _, ser := range series {
+			ls, err := LabelsFromSlice(ser)
+			if err != nil {
+				t.Errorf("invalid labels %+v, %v", ls, err)
+			}
+			lsi = append(lsi, samplesInfo{labels: ls, seriesID: -1})
+		}
+		return lsi
+	}
+
+	samples := makeSamples(series)
+	_, _, err := inserter.setSeriesIds(samples)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedIds := map[string]SeriesID{
+		"value_1": SeriesID(1),
+		"value_2": SeriesID(2),
+	}
+
+	for _, si := range samples {
+		value := si.labels.values[1]
+		expectedId := expectedIds[value]
+		if si.seriesID != expectedId {
+			t.Errorf("incorrect ID:\ngot: %v\nexpected: %v", si.seriesID, expectedId)
+		}
+	}
+
+	// refreshing during the same epoch givesthe same IDs without checking the DB
+	inserter.refreshSeriesCache()
+
+	samples = makeSamples(series)
+	_, _, err = inserter.setSeriesIds(samples)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, si := range samples {
+		value := si.labels.values[1]
+		expectedId := expectedIds[value]
+		if si.seriesID != expectedId {
+			t.Errorf("incorrect ID:\ngot: %v\nexpected: %v", si.seriesID, expectedId)
+		}
+	}
+
+	// trash the cache
+	inserter.refreshSeriesCache()
+
+	// retrying rechecks the DB and uses the new IDs
+	samples = makeSamples(series)
+	_, _, err = inserter.setSeriesIds(samples)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedIds = map[string]SeriesID{
+		"value_1": SeriesID(3),
+		"value_2": SeriesID(4),
+	}
+
+	for _, si := range samples {
+		value := si.labels.values[1]
+		expectedId := expectedIds[value]
+		if si.seriesID != expectedId {
+			t.Errorf("incorrect ID:\ngot: %v\nexpected: %v", si.seriesID, expectedId)
+		}
 	}
 }
 
