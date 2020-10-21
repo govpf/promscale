@@ -789,6 +789,9 @@ func (h *insertHandler) setSeriesIds(sampleInfos []samplesInfo) (string, Epoch, 
 	if epoch == -1 || newEpoch < epoch {
 		epoch = newEpoch
 	}
+	if h.seriesCacheEpoch == -1 || newEpoch < h.seriesCacheEpoch {
+		h.seriesCacheEpoch = newEpoch
+	}
 
 	// COMMIT;
 	_, err = br.Exec()

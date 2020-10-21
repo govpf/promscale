@@ -338,6 +338,49 @@ func TestSQLDropMetricChunk(t *testing.T) {
 			t.Error(err)
 		}
 
+		before_drop_correct := func(num_data_rows int, loc string) {
+			count := 0
+			err = db.QueryRow(context.Background(), `SELECT count(*) FROM prom_data.test`).Scan(&count)
+			if err != nil {
+				t.Error(loc, err)
+			}
+			if count != num_data_rows {
+				t.Errorf("unexpected row count: %v @ %v", count, loc)
+			}
+
+			err = db.QueryRow(context.Background(), `SELECT count(*) FROM _prom_catalog.series`).Scan(&count)
+			if err != nil {
+				t.Error(loc, err)
+			}
+
+			// none of the series should be removed yet
+			if count != 3 {
+				t.Errorf("unexpected series count: %v @ %v", count, loc)
+			}
+
+			err = db.QueryRow(context.Background(), `SELECT count(*) FROM _prom_catalog.series WHERE delete_epoch IS NOT NULL`).Scan(&count)
+			if err != nil {
+				t.Error(loc, err)
+			}
+
+			// none of the series should be marked for deletion
+			if count != 0 {
+				t.Errorf("unexpected series count: %v @ %v", count, loc)
+			}
+
+			err = db.QueryRow(context.Background(), `SELECT count(*) FROM _prom_catalog.label where key='name1'`).Scan(&count)
+			if err != nil {
+				t.Error(loc, err)
+			}
+
+			// none of the labels should deleted yet
+			if count != 3 {
+				t.Errorf("unexpected labels count: %v @ %v", count, loc)
+			}
+		}
+
+		before_drop_correct(4, "before drop")
+
 		_, err = db.Exec(context.Background(), "CALL _prom_catalog.drop_metric_chunks($1, $2)", "test", chunkEnds.Add(time.Second*5))
 		if err != nil {
 			t.Fatal(err)
@@ -458,6 +501,37 @@ func TestSQLDropMetricChunk(t *testing.T) {
 		}
 
 		after_delete_correct("after all loops")
+
+		resurrected := []prompb.TimeSeries{
+			{
+				//this series will be deleted along with it's label
+				Labels: []prompb.Label{
+					{Name: MetricNameLabelName, Value: "test"},
+					{Name: "name1", Value: "value1"},
+				},
+				Samples: []prompb.Sample{
+					{Timestamp: int64(model.TimeFromUnixNano(chunkEnds.Add(time.Hour * 5).UnixNano())), Value: 0.1},
+				},
+			},
+		}
+
+		_, err = ingestor.Ingest(copyMetrics(resurrected), NewWriteRequest())
+		if err == nil {
+			t.Error("expected ingest to fail due to old epoch")
+		}
+
+		ingestor2, err := NewPgxIngestor(db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ingestor2.Close()
+
+		_, err = ingestor2.Ingest(copyMetrics(resurrected), NewWriteRequest())
+		if err != nil {
+			t.Error(err)
+		}
+
+		before_drop_correct(3, "after resurrection")
 	})
 }
 
