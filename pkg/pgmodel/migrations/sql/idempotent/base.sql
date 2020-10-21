@@ -1117,7 +1117,7 @@ BEGIN
     END IF;
 
     EXECUTE format($query$
-        -- recheck that the sries IDs we might delete are actually dead
+        -- recheck that the series IDs we might delete are actually dead
         WITH dead_series AS (
             SELECT id FROM SCHEMA_DATA_SERIES.%1$I
                 WHERE delete_epoch <= %2$L

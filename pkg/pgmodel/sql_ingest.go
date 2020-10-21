@@ -480,7 +480,7 @@ func (h *insertHandler) handleReq(req insertDataRequest) bool {
 	// we fill in any SeriesIds we have in cache now so we can free any Labels
 	// that are no longer needed, and because the SeriesIds might get flushed.
 	// (neither of these are that critical at the moment)
-	_, epoch := h.fillKnowSeriesIds(req.data)
+	_, epoch := h.fillKnownSeriesIds(req.data)
 	needsFlush := h.pending.addReq(req, epoch)
 	if needsFlush {
 		h.flushPending()
@@ -492,7 +492,7 @@ func (h *insertHandler) handleReq(req insertDataRequest) bool {
 // Fill in any SeriesIds we already have in cache.
 // This must be idempotent: if called a second time it should not affect any
 // sampleInfo whose series was already set.
-func (h *insertHandler) fillKnowSeriesIds(sampleInfos []samplesInfo) (numMissingSeries int, epoch Epoch) {
+func (h *insertHandler) fillKnownSeriesIds(sampleInfos []samplesInfo) (numMissingSeries int, epoch Epoch) {
 	epoch = h.seriesCacheEpoch
 	for i, series := range sampleInfos {
 		// When we first create the sampleInfos we should have set the seriesID
@@ -718,7 +718,7 @@ func (pending *pendingBuffer) reportResults(err error) {
 // returns: the tableName for the metric being inserted into
 // TODO move up to the rest of insertHandler
 func (h *insertHandler) setSeriesIds(sampleInfos []samplesInfo) (string, Epoch, error) {
-	numMissingSeries, epoch := h.fillKnowSeriesIds(sampleInfos)
+	numMissingSeries, epoch := h.fillKnownSeriesIds(sampleInfos)
 
 	if numMissingSeries == 0 {
 		return "", epoch, nil
@@ -836,6 +836,7 @@ func (h *insertHandler) refreshSeriesCache() {
 		log.Error("msg", msg, "metric_table", h.metricTableName, "err", err)
 		// Trash the cache just in case an epoch change occured, seems safer
 		h.seriesCache = map[string]SeriesID{}
+		h.seriesCacheEpoch = -1
 		return
 	}
 
