@@ -86,12 +86,15 @@ func (r *sqlRecorder) SendBatch(ctx context.Context, b pgxBatch) (pgx.BatchResul
 	batch := b.(*mockBatch)
 
 	results := make([]rowResults, 0, len(batch.items))
+	errors := make([]error, 0, len(batch.items))
 	for _, q := range batch.items {
 		//TODO err
-		rows, _ := r.checkQuery(q.query, q.arguments...)
+		rows, err := r.checkQuery(q.query, q.arguments...)
 		results = append(results, rows)
+		errors = append(errors, err)
 	}
-	return &mockBatchResult{results: results}, nil
+	// TODO switch to q.query[] subslice
+	return &mockBatchResult{results: results, errors: errors}, nil
 }
 
 func (r *sqlRecorder) checkQuery(sql string, args ...interface{}) (rowResults, error) {
@@ -106,7 +109,7 @@ func (r *sqlRecorder) checkQuery(sql string, args ...interface{}) (rowResults, e
 		r.t.Errorf("@ %d unexpected query:\ngot:\n\t%s\nexpected:\n\t%s", idx, sql, row.sql)
 	}
 	if !reflect.DeepEqual(args, row.args) {
-		r.t.Errorf("@ %d unexpected query args for\n\t%s\ngot:\n\t%v\nexpected:\n\t%v", idx, sql, args, row.args)
+		r.t.Errorf("@ %d unexpected query args for\n\t%s\ngot:\n\t%#v\nexpected:\n\t%#v", idx, sql, args, row.args)
 	}
 	return row.results, row.err
 }
@@ -132,24 +135,41 @@ func (b *mockBatch) Queue(query string, arguments ...interface{}) {
 type mockBatchResult struct {
 	idx     int
 	results []rowResults
+	errors  []error
 }
 
 // Exec reads the results from the next query in the batch as if the query has been sent with Conn.Exec.
 func (m *mockBatchResult) Exec() (pgconn.CommandTag, error) {
 	defer func() { m.idx++ }()
-	if len(m.results[m.idx]) != 0 {
-		panic("tried to return results using Exec")
+	var err error
+	if m.errors != nil && m.idx < len(m.errors) {
+		err = m.errors[m.idx]
 	}
-	return nil, nil
+
+	if len(m.results[m.idx]) == 0 {
+		return nil, err
+	}
+	if len(m.results[m.idx]) != 1 {
+		return nil, fmt.Errorf("mock exec: too many return rows %v", m.results[m.idx])
+	}
+	if len(m.results[m.idx][0]) != 1 {
+		return nil, fmt.Errorf("mock exec: too many return values %v", m.results[m.idx][0])
+	}
+
+	return m.results[m.idx][0][0].(pgconn.CommandTag), err
 }
 
 // Query reads the results from the next query in the batch as if the query has been sent with Conn.Query.
 func (m *mockBatchResult) Query() (pgx.Rows, error) {
 	defer func() { m.idx++ }()
-	if len(m.results) <= m.idx {
-		return &mockRows{results: nil, noNext: false}, nil
+	var err error
+	if m.idx < len(m.errors) {
+		err = m.errors[m.idx]
 	}
-	return &mockRows{results: m.results[m.idx], noNext: false}, nil
+	if len(m.results) <= m.idx {
+		return &mockRows{results: nil, noNext: false}, err
+	}
+	return &mockRows{results: m.results[m.idx], noNext: false}, err
 }
 
 // Close closes the batch operation. This must be called before the underlying connection can be used again. Any error
@@ -162,11 +182,15 @@ func (m *mockBatchResult) Close() error {
 // QueryRow reads the results from the next query in the batch as if the query has been sent with Conn.QueryRow.
 func (m *mockBatchResult) QueryRow() pgx.Row {
 	defer func() { m.idx++ }()
+	var err error
+	if m.idx < len(m.errors) {
+		err = m.errors[m.idx]
+	}
 	if len(m.results) <= m.idx {
-		return &mockRows{results: nil, noNext: false}
+		return &mockRows{results: nil, noNext: false, err: err}
 
 	}
-	return &mockRows{results: m.results[m.idx], noNext: false}
+	return &mockRows{results: m.results[m.idx], noNext: false, err: err}
 }
 
 type mockRows struct {
@@ -302,7 +326,7 @@ func (m *mockRows) Scan(dest ...interface{}) error {
 			dvp := reflect.Indirect(dv)
 			dvp.SetUint(m.results[m.idx][i].(uint64))
 		case int64:
-			_, ok1 := dest[i].(int64)
+			_, ok1 := dest[i].(*int64)
 			_, ok2 := dest[i].(*SeriesID)
 			if !ok1 && !ok2 {
 				return fmt.Errorf("wrong value type int64")
@@ -383,6 +407,14 @@ func TestPGXInserterInsertSeries(t *testing.T) {
 			sqlQueries: []sqlQuery{
 				{sql: "BEGIN;"},
 				{
+					sql:     "SELECT current_epoch FROM _prom_catalog.ids_epoch LIMIT 1",
+					args:    []interface{}(nil),
+					results: rowResults{{int64(1)}},
+					err:     error(nil),
+				},
+				{sql: "COMMIT;"},
+				{sql: "BEGIN;"},
+				{
 					sql: "SELECT * FROM _prom_catalog.get_or_create_series_id_for_kv_array($1, $2, $3)",
 					args: []interface{}{
 						"metric_1",
@@ -408,6 +440,14 @@ func TestPGXInserterInsertSeries(t *testing.T) {
 				},
 			},
 			sqlQueries: []sqlQuery{
+				{sql: "BEGIN;"},
+				{
+					sql:     "SELECT current_epoch FROM _prom_catalog.ids_epoch LIMIT 1",
+					args:    []interface{}(nil),
+					results: rowResults{{int64(1)}},
+					err:     error(nil),
+				},
+				{sql: "COMMIT;"},
 				{sql: "BEGIN;"},
 				{
 					sql: "SELECT * FROM _prom_catalog.get_or_create_series_id_for_kv_array($1, $2, $3)",
@@ -451,6 +491,14 @@ func TestPGXInserterInsertSeries(t *testing.T) {
 			sqlQueries: []sqlQuery{
 				{sql: "BEGIN;"},
 				{
+					sql:     "SELECT current_epoch FROM _prom_catalog.ids_epoch LIMIT 1",
+					args:    []interface{}(nil),
+					results: rowResults{{int64(1)}},
+					err:     error(nil),
+				},
+				{sql: "COMMIT;"},
+				{sql: "BEGIN;"},
+				{
 					sql: "SELECT * FROM _prom_catalog.get_or_create_series_id_for_kv_array($1, $2, $3)",
 					args: []interface{}{
 						"metric_1",
@@ -486,6 +534,14 @@ func TestPGXInserterInsertSeries(t *testing.T) {
 				},
 			},
 			sqlQueries: []sqlQuery{
+				{sql: "BEGIN;"},
+				{
+					sql:     "SELECT current_epoch FROM _prom_catalog.ids_epoch LIMIT 1",
+					args:    []interface{}(nil),
+					results: rowResults{{int64(1)}},
+					err:     error(nil),
+				},
+				{sql: "COMMIT;"},
 				{sql: "BEGIN;"},
 				{
 					sql: "SELECT * FROM _prom_catalog.get_or_create_series_id_for_kv_array($1, $2, $3)",
@@ -529,7 +585,7 @@ func TestPGXInserterInsertSeries(t *testing.T) {
 				lsi = append(lsi, samplesInfo{labels: ls, seriesID: -1})
 			}
 
-			_, err := inserter.setSeriesIds(lsi)
+			_, _, err := inserter.setSeriesIds(lsi)
 			if err != nil {
 				foundErr := false
 				for _, q := range c.sqlQueries {
@@ -545,9 +601,11 @@ func TestPGXInserterInsertSeries(t *testing.T) {
 				}
 			}
 
-			for _, si := range lsi {
-				if si.seriesID <= 0 {
-					t.Error("Series not set", lsi)
+			if err == nil {
+				for _, si := range lsi {
+					if si.seriesID <= 0 {
+						t.Error("Series not set", lsi)
+					}
 				}
 			}
 		})
@@ -581,13 +639,19 @@ func TestPGXInserterInsertData(t *testing.T) {
 					err:     error(nil),
 				},
 				{
+					sql:     "SELECT CASE current_epoch > $1::BIGINT + 1 WHEN true THEN _prom_catalog.epoch_abort($1) END FROM _prom_catalog.ids_epoch LIMIT 1",
+					args:    []interface{}{int64(-1)},
+					results: rowResults{{[]byte{}}},
+					err:     error(nil),
+				},
+				{
 					sql: `INSERT INTO "prom_data"."metric_0"(time, value, series_id) SELECT * FROM unnest($1::TIMESTAMPTZ[], $2::DOUBLE PRECISION[], $3::BIGINT[]) a(t,v,s) ORDER BY s,t ON CONFLICT DO NOTHING`,
 					args: []interface{}{
 						[]time.Time{time.Unix(0, 0)},
 						[]float64{0},
 						[]int64{0},
 					},
-					results: rowResults{{"metric_0", true}},
+					results: rowResults{{pgconn.CommandTag{'1'}}},
 					err:     error(nil),
 				},
 			},
@@ -609,13 +673,19 @@ func TestPGXInserterInsertData(t *testing.T) {
 					err:     error(nil),
 				},
 				{
+					sql:     "SELECT CASE current_epoch > $1::BIGINT + 1 WHEN true THEN _prom_catalog.epoch_abort($1) END FROM _prom_catalog.ids_epoch LIMIT 1",
+					args:    []interface{}{int64(-1)},
+					results: rowResults{{[]byte{}}},
+					err:     error(nil),
+				},
+				{
 					sql: `INSERT INTO "prom_data"."metric_0"(time, value, series_id) SELECT * FROM unnest($1::TIMESTAMPTZ[], $2::DOUBLE PRECISION[], $3::BIGINT[]) a(t,v,s) ORDER BY s,t ON CONFLICT DO NOTHING`,
 					args: []interface{}{
 						[]time.Time{time.Unix(0, 0), time.Unix(0, 0)},
 						[]float64{0, 0},
 						[]int64{0, 0},
 					},
-					results: rowResults{},
+					results: rowResults{{pgconn.CommandTag{'1'}}},
 					err:     error(nil),
 				},
 			},
@@ -642,6 +712,37 @@ func TestPGXInserterInsertData(t *testing.T) {
 			},
 		},
 		{
+			name: "Epoch Error",
+			rows: map[string][]samplesInfo{
+				"metric_0": {{samples: make([]prompb.Sample, 1)}},
+			},
+			sqlQueries: []sqlQuery{
+				{sql: "CALL _prom_catalog.finalize_metric_creation()"},
+				{
+					sql:     "SELECT table_name, possibly_new FROM _prom_catalog.get_or_create_metric_table_name($1)",
+					args:    []interface{}{"metric_0"},
+					results: rowResults{{"metric_0", true}},
+					err:     error(nil),
+				},
+				{
+					sql:     "SELECT CASE current_epoch > $1::BIGINT + 1 WHEN true THEN _prom_catalog.epoch_abort($1) END FROM _prom_catalog.ids_epoch LIMIT 1",
+					args:    []interface{}{int64(-1)},
+					results: rowResults{{[]byte{}}},
+					err:     fmt.Errorf("epoch error"),
+				},
+				{
+					sql: `INSERT INTO "prom_data"."metric_0"(time, value, series_id) SELECT * FROM unnest($1::TIMESTAMPTZ[], $2::DOUBLE PRECISION[], $3::BIGINT[]) a(t,v,s) ORDER BY s,t ON CONFLICT DO NOTHING`,
+					args: []interface{}{
+						[]time.Time{time.Unix(0, 0)},
+						[]float64{0},
+						[]int64{0},
+					},
+					results: rowResults{},
+					err:     error(nil),
+				},
+			},
+		},
+		{
 			name: "Copy from error",
 			rows: map[string][]samplesInfo{
 				"metric_0": {
@@ -662,13 +763,19 @@ func TestPGXInserterInsertData(t *testing.T) {
 					err:     error(nil),
 				},
 				{
+					sql:     "SELECT CASE current_epoch > $1::BIGINT + 1 WHEN true THEN _prom_catalog.epoch_abort($1) END FROM _prom_catalog.ids_epoch LIMIT 1",
+					args:    []interface{}{int64(-1)},
+					results: rowResults{{[]byte{}}},
+					err:     error(nil),
+				},
+				{
 					sql: `INSERT INTO "prom_data"."metric_0"(time, value, series_id) SELECT * FROM unnest($1::TIMESTAMPTZ[], $2::DOUBLE PRECISION[], $3::BIGINT[]) a(t,v,s) ORDER BY s,t ON CONFLICT DO NOTHING`,
 					args: []interface{}{
 						[]time.Time{time.Unix(0, 0), time.Unix(0, 0), time.Unix(0, 0), time.Unix(0, 0), time.Unix(0, 0)},
 						make([]float64, 5),
 						make([]int64, 5),
 					},
-					results: rowResults{},
+					results: rowResults{{pgconn.CommandTag{'1'}}},
 					err:     fmt.Errorf("some INSERT error"),
 				},
 			},
@@ -710,6 +817,11 @@ func TestPGXInserterInsertData(t *testing.T) {
 	for _, co := range testCases {
 		c := co
 		t.Run(c.name, func(t *testing.T) {
+
+			if c.name == "Epoch Error" {
+				t.Logf("breakpoint!")
+			}
+
 			mock := newSqlRecorder(c.sqlQueries, t)
 
 			metricCache := map[string]string{"metric_1": "metricTableName_1"}
@@ -1440,9 +1552,7 @@ func TestPGXQuerierQuery(t *testing.T) {
 						t.Errorf("unexpected error:\ngot\n\t%v\nwanted\n\t%v", err, c.err)
 					}
 				}
-			}
-
-			if !reflect.DeepEqual(result, c.result) {
+			} else if !reflect.DeepEqual(result, c.result) {
 				t.Errorf("unexpected result:\ngot\n%#v\nwanted\n%+v", result, c.result)
 			}
 		})
